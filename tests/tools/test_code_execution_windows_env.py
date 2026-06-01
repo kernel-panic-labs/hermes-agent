@@ -120,6 +120,74 @@ class TestScrubChildEnvWindows:
         assert "HOME" in scrubbed
         assert "TEMP" in scrubbed
 
+    def test_missing_windows_essentials_are_injected_when_is_windows_true(self):
+        """GUI launchers can omit SYSTEMROOT entirely; inject safe fallbacks."""
+        env = {
+            "PATH": r"C:\\Windows\\System32;C:\\Python311",
+            "TEMP": r"C:\\Users\\alice\\AppData\\Local\\Temp",
+        }
+        scrubbed = _scrub_child_env(env,
+                                    is_passthrough=_no_passthrough,
+                                    is_windows=True)
+
+        assert scrubbed["SYSTEMROOT"]
+        assert scrubbed["WINDIR"]
+        assert scrubbed["SYSTEMDRIVE"]
+        assert scrubbed["COMSPEC"].lower().endswith("cmd.exe")
+
+    def test_registry_percent_refs_expand_without_process_systemroot(self, monkeypatch):
+        """Expand %SystemRoot% using injected values even if parent env lacks it."""
+        import types
+
+        registry_values = {
+            "SYSTEMROOT": (r"C:\\Windows", None),
+            "WINDIR": (r"%SystemRoot%", None),
+            "SYSTEMDRIVE": ("C:", None),
+            "COMSPEC": (r"%SystemRoot%\\System32\\cmd.exe", None),
+        }
+
+        class FakeKey:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_winreg = types.SimpleNamespace(
+            HKEY_LOCAL_MACHINE=object(),
+            OpenKey=lambda *_args: FakeKey(),
+            QueryValueEx=lambda _key, name: registry_values[name],
+        )
+        monkeypatch.setitem(sys.modules, "winreg", fake_winreg)
+        monkeypatch.delenv("SYSTEMROOT", raising=False)
+        monkeypatch.delenv("SystemRoot", raising=False)
+
+        env = {
+            "PATH": r"C:\\Windows\\System32;C:\\Python311",
+            "TEMP": r"C:\\Users\\alice\\AppData\\Local\\Temp",
+        }
+        scrubbed = _scrub_child_env(env,
+                                    is_passthrough=_no_passthrough,
+                                    is_windows=True)
+
+        assert scrubbed["WINDIR"] == r"C:\\Windows"
+        assert scrubbed["COMSPEC"] == r"C:\\Windows\\System32\\cmd.exe"
+        assert "%" not in scrubbed["COMSPEC"]
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows registry expansion smoke test")
+    def test_injected_registry_values_are_expanded_on_windows(self):
+        """REG_EXPAND_SZ values such as %SystemRoot%\\system32\\cmd.exe must expand."""
+        env = {
+            "PATH": r"C:\\Windows\\System32;C:\\Python311",
+            "TEMP": r"C:\\Users\\alice\\AppData\\Local\\Temp",
+        }
+        scrubbed = _scrub_child_env(env,
+                                    is_passthrough=_no_passthrough,
+                                    is_windows=True)
+
+        assert "%" not in scrubbed["COMSPEC"]
+        assert scrubbed["COMSPEC"].lower().endswith("cmd.exe")
+
     def test_secrets_still_blocked_on_windows(self):
         """The Windows allowlist must NOT defeat the secret-substring block.
 

@@ -185,6 +185,64 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             # Non-secret (secrets were already dropped above) and not in any
             # allowlist — a deliberately-dropped HERMES_* var.
             _dropped_hermes.append(k)
+    # On Windows, inject essential OS vars that may be missing when Hermes is
+    # launched from a GUI app (e.g. Electron desktop) rather than a console.
+    # Without SYSTEMROOT, Python's socket module can't locate mswsock.dll and
+    # raises WinError 10106.  These are well-known static paths, not secrets.
+    if is_windows:
+        _WINDOWS_FALLBACKS = {
+            "SYSTEMROOT": "C:\\Windows",
+            "WINDIR": "C:\\Windows",
+            "SYSTEMDRIVE": "C:",
+            "COMSPEC": "C:\\Windows\\System32\\cmd.exe",
+        }
+        existing_keys = {k.upper() for k in scrubbed}
+        try:
+            import winreg  # noqa: PLC0415
+        except Exception:
+            winreg = None
+
+        def _expand_windows_env_refs(value, env_map):
+            """Expand %VAR% references using env_map, not the process env."""
+            import re  # noqa: PLC0415
+
+            lookup = {k.upper(): str(v) for k, v in env_map.items()}
+
+            def replace(match):
+                name = match.group(1).upper()
+                return lookup.get(name, match.group(0))
+
+            previous = str(value)
+            for _ in range(4):
+                expanded = re.sub(r"%([^%]+)%", replace, previous)
+                if expanded == previous:
+                    return expanded
+                previous = expanded
+            return previous
+
+        pending_injections = {}
+        for var, default in _WINDOWS_FALLBACKS.items():
+            if var in existing_keys:
+                continue
+            value = default
+            if winreg is not None:
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE,
+                        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+                    ) as reg_key:
+                        real_val, _ = winreg.QueryValueEx(reg_key, var)
+                    value = str(real_val)
+                except Exception:
+                    value = default
+            pending_injections[var] = value
+
+        expansion_env = {**_WINDOWS_FALLBACKS, **scrubbed, **pending_injections}
+        for var, value in pending_injections.items():
+            scrubbed[var] = _expand_windows_env_refs(value, expansion_env)
+            existing_keys.add(var)
+            expansion_env[var] = scrubbed[var]
+
     if _dropped_hermes:
         logger.debug(
             "execute_code: dropped %d non-allowlisted HERMES_* var(s) from the "
